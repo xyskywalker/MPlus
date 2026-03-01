@@ -1,0 +1,267 @@
+/**
+ * MPlus 全局样式
+ * Tailwind CSS 配置和自定义组件样式
+ */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 基础样式 */
+@layer base {
+  body {
+    @apply text-gray-900 dark:text-gray-100;
+    font-family: "PingFang SC", "Microsoft YaHei", "Hiragino Sans GB", sans-serif;
+  }
+  
+  /* 滚动条样式 */
+  ::-webkit-scrollbar {
+    @apply w-2 h-2;
+  }
+  
+  ::-webkit-scrollbar-track {
+    @apply bg-gray-100 dark:bg-dark-800 rounded;
+  }
+  
+  ::-webkit-scrollbar-thumb {
+    @apply bg-gray-300 dark:bg-dark-600 rounded hover:bg-gray-400 dark:hover:bg-dark-500;
+  }
+}
+
+/* 自定义组件样式 */
+@layer components {
+  /* 主要按钮 */
+  .btn-primary {
+    @apply px-4 py-2 bg-gradient-to-r from-primary-500 via-purple-500 to-purple-600 
+           text-white rounded-lg font-medium
+           hover:from-primary-600 hover:via-purple-600 hover:to-purple-700
+           focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2
+           disabled:opacity-50 disabled:cursor-not-allowed
+           transition-all duration-200;
+  }
+  
+  /* 次要按钮 */
+  .btn-secondary {
+    @apply px-4 py-2 bg-gray-100 dark:bg-dark-700 
+           text-gray-700 dark:text-gray-300 rounded-lg font-medium
+           hover:bg-gray-200 dark:hover:bg-dark-600
+           focus:outline-none focus:ring-2 focus:ring-gray-300 focus:ring-offset-2
+           disabled:opacity-50 disabled:cursor-not-allowed
+           transition-all duration-200;
+  }
+  
+  /* 文字按钮 */
+  .btn-text {
+    @apply px-3 py-1.5 text-gray-600 dark:text-gray-400 
+           hover:text-primary-600 dark:hover:text-primary-400
+           hover:bg-gray-100 dark:hover:bg-dark-800 rounded-lg
+           transition-colors duration-200;
+  }
+  
+  /* 危险按钮 */
+  .btn-danger {
+    @apply px-4 py-2 bg-red-500 text-white rounded-lg font-medium
+           hover:bg-red-600 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2
+           disabled:opacity-50 disabled:cursor-not-allowed
+           transition-all duration-200;
+  }
+  
+  /* 卡片 */
+  .card {
+    @apply bg-white dark:bg-dark-800 rounded-xl shadow-sm 
+           border border-gray-100 dark:border-dark-700 p-4
+           transition-shadow duration-200;
+  }
+  
+  .card-hover {
+    @apply card hover:shadow-md hover:-translate-y-0.5 transition-all duration-200;
+  }
+  
+  /* 输入框 - 使用 ring-inset 避免在 overflow 滚动容器中焦点环被裁剪 */
+  .input {
+    @apply w-full px-3 py-2 bg-white dark:bg-dark-800 
+           border border-gray-200 dark:border-dark-600 rounded-lg
+           text-gray-900 dark:text-gray-100
+           placeholder-gray-400 dark:placeholder-gray-500
+           focus:outline-none focus:ring-2 focus:ring-inset focus:ring-primary-500 focus:border-primary-500
+           disabled:bg-gray-100 dark:disabled:bg-dark-700 disabled:cursor-not-allowed
+           transition-colors duration-200;
+  }
+  
+  /* 选择框 */
+  .select {
+    @apply input appearance-none bg-no-repeat cursor-pointer;
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e");
+    background-position: right 0.5rem center;
+    background-size: 1.5em 1.5em;
+    padding-right: 2.5rem;
+  }
+  
+  /* 标签 */
+  .tag {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  }
+  
+  .tag-primary {
+    @apply tag bg-primary-100 dark:bg-primary-900/30 text-primary-700 dark:text-primary-400;
+  }
+  
+  .tag-success {
+    @apply tag bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400;
+  }
+  
+  .tag-warning {
+    @apply tag bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-400;
+  }
+  
+  .tag-error {
+    @apply tag bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400;
+  }
+  
+  .tag-gray {
+    @apply tag bg-gray-100 dark:bg-dark-700 text-gray-600 dark:text-gray-400;
+  }
+}
+
+/* 动画 */
+@layer utilities {
+  .animate-fade-in {
+    animation: fadeIn 0.3s ease-out;
+  }
+  
+  .animate-slide-up {
+    animation: slideUp 0.3s ease-out;
+  }
+  
+  .animate-slide-down {
+    animation: slideDown 0.3s ease-out;
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Markdown 渲染样式 — 对话消息中的富文本排版 */
+.markdown-body {
+  line-height: 1.7;
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+
+/* 流式渲染稳定性：防止内容更新时布局抖动 */
+.markdown-body > *:first-child {
+  margin-top: 0 !important;
+}
+.markdown-body > *:last-child {
+  margin-bottom: 0 !important;
+}
+
+/* 段落间距 */
+.markdown-body p + p {
+  margin-top: 0.5rem;
+}
+
+/* 列表嵌套缩进 */
+.markdown-body ul ul,
+.markdown-body ol ol,
+.markdown-body ul ol,
+.markdown-body ol ul {
+  margin-top: 0.25rem;
+  margin-bottom: 0.25rem;
+}
+
+/* 代码块文字不换行 */
+.markdown-body pre code {
+  @apply text-gray-100;
+  font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', 'Monaco', 'Consolas', monospace;
+  font-size: 0.85em;
+  white-space: pre;
+}
+
+/* 行内代码字体 */
+.markdown-body code {
+  font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', 'Monaco', 'Consolas', monospace;
+}
+
+/* 引用块左边框宽度（Tailwind 默认无 border-l-3） */
+.markdown-body blockquote {
+  border-left-width: 3px;
+}
+
+/* 任务列表（GFM 扩展） */
+.markdown-body input[type="checkbox"] {
+  @apply mr-1.5 rounded border-gray-300 dark:border-dark-500 text-primary-500;
+  pointer-events: none;
+}
+
+/* 表格条纹行 */
+.markdown-assistant table tbody tr:nth-child(even) {
+  @apply bg-gray-50 dark:bg-dark-700/50;
+}
+.markdown-user table tbody tr:nth-child(even) {
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+/* 删除线 */
+.markdown-body del {
+  @apply opacity-60;
+}
+
+/* 加载动画 - 跳动点 */
+.loading-dots {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.loading-dots span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: currentColor;
+  animation: loadingDot 1.4s infinite ease-in-out both;
+}
+
+.loading-dots span:nth-child(1) {
+  animation-delay: -0.32s;
+}
+
+.loading-dots span:nth-child(2) {
+  animation-delay: -0.16s;
+}
+
+@keyframes loadingDot {
+  0%, 80%, 100% {
+    transform: scale(0);
+  }
+  40% {
+    transform: scale(1);
+  }
+}
