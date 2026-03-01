@@ -5,12 +5,15 @@ MPlus TUI 主程序
 """
 
 import platform
+import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
 import webbrowser
+import os
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -39,6 +42,9 @@ except ImportError:
 
 # 项目根目录
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+DATA_DIR = PROJECT_ROOT / "data"
+TUI_STATE_DIR = DATA_DIR / "tui"
+SERVER_LOG_FILE = TUI_STATE_DIR / "server.log"
 
 # 控制台实例
 console = Console()
@@ -96,6 +102,243 @@ def open_browser(url: str):
         console.print(f"  [yellow]⚠️  无法自动打开浏览器，请手动访问: {url}[/yellow]")
 
 
+def _ensure_runtime_dir():
+    """确保 TUI 运行时目录存在"""
+    TUI_STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _is_process_alive(pid: Optional[int]) -> bool:
+    """判断进程是否存活（跨平台）"""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+    # Unix 下进一步排除僵尸进程
+    if platform.system() != "Windows":
+        try:
+            r = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "stat="],
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+            stat = (r.stdout or "").strip()
+            if stat.startswith("Z"):
+                return False
+        except Exception:
+            pass
+
+    return True
+
+
+def _list_listening_pids(port: str) -> list[int]:
+    """获取指定端口的监听进程 PID 列表"""
+    pids: set[int] = set()
+    if platform.system() == "Windows":
+        try:
+            r = subprocess.run(
+                ["netstat", "-ano", "-p", "tcp"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if r.returncode == 0:
+                target = f":{port}"
+                for raw in r.stdout.splitlines():
+                    line = raw.strip()
+                    if "LISTENING" not in line:
+                        continue
+                    if target not in line:
+                        continue
+                    parts = line.split()
+                    if parts:
+                        try:
+                            pids.add(int(parts[-1]))
+                        except ValueError:
+                            pass
+        except Exception:
+            pass
+        return sorted(pids)
+
+    try:
+        r = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    pids.add(int(s))
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+
+    # Linux fallback: 无 lsof 时尝试 ss
+    if not pids:
+        try:
+            r = subprocess.run(
+                ["ss", "-ltnp"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if r.returncode == 0:
+                target = f":{port}"
+                for line in r.stdout.splitlines():
+                    if target not in line:
+                        continue
+                    for pid_text in re.findall(r"pid=(\d+)", line):
+                        try:
+                            pids.add(int(pid_text))
+                        except ValueError:
+                            pass
+        except Exception:
+            pass
+
+    return sorted(pids)
+
+
+def _get_process_cmdline(pid: int) -> str:
+    """读取进程命令行（失败返回空字符串）"""
+    if platform.system() == "Windows":
+        try:
+            r = subprocess.run(
+                [
+                    "wmic",
+                    "process",
+                    "where",
+                    f"processid={pid}",
+                    "get",
+                    "CommandLine",
+                    "/value",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if r.returncode == 0:
+                for line in r.stdout.splitlines():
+                    if line.startswith("CommandLine="):
+                        return line.partition("=")[2].strip()
+        except Exception:
+            pass
+        return ""
+
+    # Linux 优先走 /proc，避免依赖 ps
+    proc_cmdline = Path(f"/proc/{pid}/cmdline")
+    if proc_cmdline.exists():
+        try:
+            raw = proc_cmdline.read_bytes()
+            parts = [p for p in raw.decode(errors="replace").split("\x00") if p]
+            return " ".join(parts).strip()
+        except Exception:
+            pass
+
+    try:
+        r = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if r.returncode == 0:
+            return (r.stdout or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _is_mplus_server_cmd(cmdline: str) -> bool:
+    """判断命令行是否为 MPlus 的 uvicorn 服务"""
+    normalized = " ".join(cmdline.lower().split())
+    return "uvicorn" in normalized and "backend.main:app" in normalized
+
+
+def _scan_port_processes(port: str) -> dict:
+    """
+    扫描端口监听进程并分类：
+    - mplus: 命中 MPlus 服务特征的 PID 列表
+    - others: 其它进程 [(pid, cmdline)]
+    """
+    mplus: list[int] = []
+    others: list[tuple[int, str]] = []
+    for pid in _list_listening_pids(port):
+        cmd = _get_process_cmdline(pid)
+        if _is_mplus_server_cmd(cmd):
+            mplus.append(pid)
+        else:
+            others.append((pid, cmd))
+    return {"mplus": sorted(set(mplus)), "others": others}
+
+
+def _is_tcp_port_open(port: str) -> bool:
+    """快速判断本机端口是否可连通"""
+    try:
+        port_num = int(port)
+    except ValueError:
+        return False
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.5)
+    try:
+        return sock.connect_ex(("127.0.0.1", port_num)) == 0
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def _tail_log_lines(max_lines: int = 20) -> list[str]:
+    """读取日志文件末尾若干行"""
+    if not SERVER_LOG_FILE.exists():
+        return []
+    try:
+        lines = SERVER_LOG_FILE.read_text(
+            encoding="utf-8", errors="replace",
+        ).splitlines()
+        return lines[-max_lines:]
+    except Exception:
+        return []
+
+
+def _terminate_server_pid(pid: int, force: bool = False):
+    """按平台停止后台服务进程"""
+    if platform.system() == "Windows":
+        cmd = ["taskkill", "/PID", str(pid), "/T"]
+        if force:
+            cmd.append("/F")
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+
+    sig = signal.SIGKILL if force else signal.SIGTERM
+    try:
+        # Unix 下服务以独立会话启动，优先结束整个进程组
+        os.killpg(pid, sig)
+        return
+    except ProcessLookupError:
+        return
+    except Exception:
+        pass
+
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        return
+
+
 # ============================================================
 #  界面展示
 # ============================================================
@@ -140,7 +383,7 @@ def print_menu():
     table.add_row("[8]", "查看日志", "查看服务运行日志")
     table.add_row("[9]", "配置管理", "查看当前系统配置")
     table.add_row("", "", "")
-    table.add_row("(q)", "(q) 退出", "")
+    table.add_row("(q)", "(q) 退出 TUI", "后台服务将继续运行")
 
     console.print(Panel(
         table,
@@ -683,44 +926,48 @@ def _read_env_host() -> str:
 
 def get_server_status() -> dict:
     """获取服务运行状态"""
-    global server_process
     port = _read_env_port()
     info = {"running": False, "pid": None, "url": f"http://localhost:{port}"}
 
-    if server_process and server_process.poll() is None:
+    scan = _scan_port_processes(port)
+    if scan["mplus"]:
+        pid = scan["mplus"][0]
+        info["running"] = True
+        info["pid"] = pid
+    elif server_process and server_process.poll() is None:
+        # 兼容当前会话内尚未写入 PID 的极端情况
         info["running"] = True
         info["pid"] = server_process.pid
 
     return info
 
 
-def _wait_for_server(port: str, max_wait: int = 15) -> bool:
-    """轮询等待服务就绪，返回是否成功"""
+def _wait_for_server(port: str, pid: Optional[int], max_wait: int = 15) -> str:
+    """轮询等待服务就绪，返回 ready / alive_timeout / failed"""
     import urllib.error
     import urllib.request
 
     console.print("  等待服务就绪", end="")
     for _ in range(max_wait):
         time.sleep(1)
-        # 进程已退出
-        if server_process and server_process.poll() is not None:
+        if pid and not _is_process_alive(pid):
             console.print(" [red]失败[/red]")
-            return False
+            return "failed"
         try:
             urllib.request.urlopen(
                 f"http://127.0.0.1:{port}/api/health", timeout=2,
             )
             console.print(" [green]就绪[/green]")
-            return True
+            return "ready"
         except (urllib.error.URLError, OSError):
             console.print(".", end="")
 
-    # 超时但进程仍在
-    if server_process and server_process.poll() is None:
+    # 超时但进程仍在：可能是首次启动较慢，保留为后台运行
+    if pid and _is_process_alive(pid):
         console.print(" [yellow]超时（进程仍在运行）[/yellow]")
-        return True
+        return "alive_timeout"
     console.print(" [red]失败[/red]")
-    return False
+    return "failed"
 
 
 def start_server(auto_open_browser: bool = False):
@@ -749,40 +996,92 @@ def start_server(auto_open_browser: bool = False):
     host = _read_env_host()
     port = _read_env_port()
 
-    try:
-        server_process = subprocess.Popen(
-            [
-                sys.executable, "-m", "uvicorn",
-                "backend.main:app",
-                "--host", host,
-                "--port", port,
-            ],
-            cwd=str(PROJECT_ROOT),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+    # 单机仅允许一个 MPlus 服务：通过端口监听进程精确识别
+    scan = _scan_port_processes(port)
+    if scan["mplus"]:
+        pid = scan["mplus"][0]
+        url = f"http://localhost:{port}"
+        console.print(f"[yellow]检测到服务已运行 (PID: {pid})[/yellow]")
+        console.print(f"  访问地址: [link]{url}[/link]")
+        if auto_open_browser:
+            open_browser(url)
+        return
+    if scan["others"]:
+        pid = scan["others"][0][0]
+        console.print(
+            f"[red]端口 {port} 已被其他进程占用 (PID: {pid})，为避免误判不会启动新服务[/red]"
         )
+        console.print(
+            "  [dim]请先释放该端口，或在 .env 中修改 PORT 后重试。[/dim]"
+        )
+        return
+    if _is_tcp_port_open(port):
+        console.print(
+            f"[red]端口 {port} 已可连通，但无法精确识别进程 PID，为避免误判不会启动新服务[/red]"
+        )
+        console.print(
+            "  [dim]请安装 lsof/ss（或在 Windows 保证 netstat+wmic 可用）后重试。[/dim]"
+        )
+        return
 
-        if _wait_for_server(port):
+    _ensure_runtime_dir()
+    startup_marker = (
+        f"\n=== MPlus service starting @ {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
+    )
+
+    try:
+        with SERVER_LOG_FILE.open("ab") as log_file:
+            log_file.write(startup_marker.encode("utf-8", errors="replace"))
+
+            popen_kwargs = {
+                "cwd": str(PROJECT_ROOT),
+                "stdin": subprocess.DEVNULL,
+                "stdout": log_file,
+                "stderr": subprocess.STDOUT,
+                "close_fds": True,
+                "env": {**os.environ, "PYTHONUNBUFFERED": "1"},
+            }
+            if platform.system() == "Windows":
+                popen_kwargs["creationflags"] = (
+                    subprocess.DETACHED_PROCESS
+                    | subprocess.CREATE_NEW_PROCESS_GROUP
+                )
+            else:
+                popen_kwargs["start_new_session"] = True
+
+            server_process = subprocess.Popen(
+                [
+                    sys.executable, "-m", "uvicorn",
+                    "backend.main:app",
+                    "--host", host,
+                    "--port", port,
+                ],
+                **popen_kwargs,
+            )
+
+        wait_result = _wait_for_server(port, server_process.pid)
+        if wait_result == "ready":
             url = f"http://localhost:{port}"
             console.print("[green]服务启动成功！[/green]")
             console.print(f"  访问地址: [link]{url}[/link]")
             console.print(f"  API 文档: [link]{url}/docs[/link]")
+            console.print(f"  日志文件: [dim]{SERVER_LOG_FILE}[/dim]")
 
             should_open = auto_open_browser or Confirm.ask(
                 "  是否打开浏览器？", default=True,
             )
             if should_open:
                 open_browser(url)
+        elif wait_result == "alive_timeout":
+            console.print(
+                "[yellow]服务仍在后台启动中，请稍后用「3. 系统状态」确认是否就绪[/yellow]"
+            )
+            console.print(f"  日志文件: [dim]{SERVER_LOG_FILE}[/dim]")
         else:
-            # 输出错误信息
-            if server_process and server_process.poll() is not None:
-                out = server_process.stdout.read()
-                if out:
-                    text = out.decode(errors="replace")
-                    for line in text.strip().splitlines()[-8:]:
-                        console.print(f"  [dim]{line}[/dim]")
-                server_process = None
-                console.print("[red]服务启动失败[/red]")
+            for line in _tail_log_lines(max_lines=8):
+                console.print(f"  [dim]{line}[/dim]")
+            server_process = None
+            console.print("[red]服务启动失败[/red]")
 
     except Exception as e:
         console.print(f"[red]启动失败: {e}[/red]")
@@ -793,19 +1092,45 @@ def stop_server():
     """停止 Web 服务"""
     global server_process
 
+    port = _read_env_port()
     status = get_server_status()
     if not status["running"]:
         console.print("[yellow]服务未运行[/yellow]")
         return
 
+    pid = status["pid"]
     console.print("[blue]正在停止服务...[/blue]")
+    still_alive = True
     try:
-        server_process.terminate()
-        server_process.wait(timeout=5)
-        console.print("[green]服务已停止[/green]")
-    except subprocess.TimeoutExpired:
-        server_process.kill()
-        console.print("[yellow]服务已强制终止[/yellow]")
+        _terminate_server_pid(pid, force=False)
+
+        deadline = time.time() + 5
+        while time.time() < deadline and _is_process_alive(pid):
+            time.sleep(0.2)
+
+        if _is_process_alive(pid):
+            _terminate_server_pid(pid, force=True)
+            deadline = time.time() + 3
+            while time.time() < deadline and _is_process_alive(pid):
+                time.sleep(0.2)
+
+        if server_process and server_process.pid == pid:
+            try:
+                server_process.wait(timeout=0.5)
+            except Exception:
+                pass
+
+        still_alive = _is_process_alive(pid)
+        if still_alive:
+            console.print("[red]停止失败：进程仍在运行[/red]")
+        else:
+            # 再次扫描端口，确保未误杀其他进程
+            scan = _scan_port_processes(port)
+            if scan["mplus"]:
+                console.print("[red]停止失败：检测到 MPlus 服务仍在运行[/red]")
+                still_alive = True
+            else:
+                console.print("[green]服务已停止[/green]")
     except Exception as e:
         console.print(f"[red]停止失败: {e}[/red]")
     finally:
@@ -825,12 +1150,14 @@ def show_status():
         table.add_row("运行状态", "[bold green]● 运行中[/bold green]")
         table.add_row("进程 PID", str(status["pid"]))
         table.add_row("访问地址", f"[link]{status['url']}[/link]")
+        table.add_row("运行模式", "后台守护（退出 TUI 不影响服务）")
     else:
         table.add_row("运行状态", "[red]○ 已停止[/red]")
 
     table.add_row("Python", f"{platform.python_version()}")
     table.add_row("操作系统", f"{platform.system()} {platform.release()}")
     table.add_row("项目目录", str(PROJECT_ROOT))
+    table.add_row("日志文件", str(SERVER_LOG_FILE))
     fe_ok = check_frontend_built()
     table.add_row(
         "前端构建",
@@ -846,25 +1173,39 @@ def show_status():
 
 def view_logs():
     """查看服务运行日志"""
-    global server_process
-
-    if not server_process or server_process.poll() is not None:
-        console.print("[yellow]服务未运行，无法查看日志[/yellow]")
+    if not SERVER_LOG_FILE.exists():
+        console.print("[yellow]暂无日志文件，请先启动服务[/yellow]")
         return
 
-    console.print("[blue]实时日志 — 按 Ctrl+C 退出:[/blue]")
+    status = get_server_status()
+    title = "实时日志 — 按 Ctrl+C 退出" if status["running"] else "历史日志"
+    console.print(f"[blue]{title}:[/blue]")
+    console.print(f"[dim]日志文件: {SERVER_LOG_FILE}[/dim]")
     console.print(Rule(style="dim"))
 
+    for line in _tail_log_lines(max_lines=40):
+        console.print(f"  {line}")
+
+    if not status["running"]:
+        return
+
     try:
-        while server_process.poll() is None:
-            line = server_process.stdout.readline()
-            if line:
-                text = line.decode(errors="replace").strip()
-                if text:
-                    console.print(f"  {text}")
+        with SERVER_LOG_FILE.open("r", encoding="utf-8", errors="replace") as f:
+            f.seek(0, os.SEEK_END)
+            while get_server_status()["running"]:
+                line = f.readline()
+                if line:
+                    console.print(f"  {line.rstrip()}")
+                else:
+                    time.sleep(0.2)
+    except FileNotFoundError:
+        console.print("[yellow]日志文件已被删除[/yellow]")
     except KeyboardInterrupt:
         console.print(Rule(style="dim"))
         console.print("[yellow]退出日志查看[/yellow]")
+    finally:
+        # 子进程为守护模式，退出查看日志不影响服务
+        pass
 
 
 def config_management():
@@ -928,15 +1269,9 @@ def install_deps_menu():
 # ============================================================
 
 def cleanup():
-    """清理资源：停止服务进程"""
+    """清理 TUI 本地资源，不影响后台服务"""
     global server_process
-    if server_process and server_process.poll() is None:
-        console.print("\n[yellow]正在停止服务...[/yellow]")
-        server_process.terminate()
-        try:
-            server_process.wait(timeout=3)
-        except Exception:
-            server_process.kill()
+    server_process = None
 
 
 def main():
@@ -955,11 +1290,26 @@ def main():
     # 首次启动快速检测
     with console.status("[bold blue]正在检测环境...[/bold blue]", spinner="dots"):
         checks = run_environment_check()
-    missing = [k for k, v in checks.items() if not v["ok"]]
-    if missing:
+    blocking_check_keys = {"python", "python_deps", "data_dir", "frontend_build"}
+    missing_blocking = [
+        key for key in blocking_check_keys
+        if key in checks and not checks[key]["ok"]
+    ]
+    missing_optional = [
+        key for key, val in checks.items()
+        if not val["ok"] and key not in blocking_check_keys
+    ]
+
+    if missing_blocking:
         console.print(
-            f"[yellow]检测到 {len(missing)} 项未就绪，"
+            f"[yellow]检测到 {len(missing_blocking)} 项关键组件未就绪，"
             f"建议选择 [bold]\"0. 一键初始化\"[/bold][/yellow]"
+        )
+    elif missing_optional:
+        names = "、".join(checks[k]["name"] for k in missing_optional)
+        console.print(
+            f"[yellow]检测到 {len(missing_optional)} 项可选组件未就绪（{names}），"
+            "不影响服务运行[/yellow]"
         )
     else:
         console.print("[green]环境检测通过，所有组件就绪[/green]")
@@ -973,7 +1323,7 @@ def main():
         choice = Prompt.ask(
             "请选择操作",
             choices=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "q"],
-            default="0" if missing else "1",
+            default="0" if missing_blocking else "1",
         )
         console.print()
 
@@ -999,8 +1349,18 @@ def main():
             config_management()
         elif choice == "q":
             if get_server_status()["running"]:
-                if Confirm.ask("服务正在运行，是否停止并退出？"):
-                    cleanup()
+                exit_choice = Prompt.ask(
+                    "服务正在运行：1)仅退出 TUI  2)停止服务并退出  3)取消",
+                    choices=["1", "2", "3"],
+                    default="1",
+                )
+                if exit_choice == "2":
+                    stop_server()
+                    break
+                if exit_choice == "1":
+                    console.print(
+                        "[green]已退出 TUI，服务将继续在后台运行[/green]"
+                    )
                     break
             else:
                 break
