@@ -55,8 +55,8 @@
 3. **启动 TUI**
 
 ```bash
-git clone <仓库地址>
-cd MPlus-dev
+git clone https://github.com/xyskywalker/MPlus
+cd MPlus
 python tui/main.py
 # 或: poetry run mplus
 ```
@@ -196,7 +196,7 @@ poetry run mplus
 ## 项目结构
 
 ```
-MPlus-dev/
+MPlus/
 ├── assets/                      # 静态资源（主视觉图片等）
 ├── backend/                     # 后端服务（FastAPI）
 │   ├── api/                     # API 路由模块
