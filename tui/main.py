@@ -32,6 +32,16 @@ except ImportError:
     print("正在安装运行依赖（来自 pyproject.toml）...")
     install_cmd = [sys.executable, "-m", "pip", "install", "."]
     result = subprocess.run(install_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        merged_output = f"{result.stdout}\n{result.stderr}".lower()
+        if "no module named pip" in merged_output:
+            subprocess.run(
+                [sys.executable, "-m", "ensurepip", "--upgrade"],
+                capture_output=True,
+                text=True,
+            )
+            result = subprocess.run(install_cmd, capture_output=True, text=True)
+
     if result.returncode != 0 and platform.system() == "Linux":
         merged_output = f"{result.stdout}\n{result.stderr}".lower()
         if (
@@ -68,7 +78,6 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 DATA_DIR = PROJECT_ROOT / "data"
 TUI_STATE_DIR = DATA_DIR / "tui"
 SERVER_LOG_FILE = TUI_STATE_DIR / "server.log"
-VENV_DIR = PROJECT_ROOT / ".venv"
 
 # 控制台实例
 console = Console()
@@ -99,17 +108,9 @@ def _npm_cmd() -> str:
     return "npm.cmd" if platform.system() == "Windows" else "npm"
 
 
-def _venv_python_path() -> Path:
-    """返回项目 .venv 内 Python 可执行文件路径"""
-    if platform.system() == "Windows":
-        return VENV_DIR / "Scripts" / "python.exe"
-    return VENV_DIR / "bin" / "python"
-
-
 def _runtime_python() -> str:
-    """返回当前应使用的 Python 解释器（优先 .venv）"""
-    venv_python = _venv_python_path()
-    return str(venv_python) if venv_python.exists() else sys.executable
+    """返回当前应使用的 Python 解释器（始终使用当前 Python）"""
+    return sys.executable
 
 
 def _read_pyproject_dependency_names() -> list[str]:
@@ -218,6 +219,23 @@ def _pip_install_with_fallback(
         return True
 
     merged_output = f"{r.stdout or ''}\n{r.stderr or ''}".lower()
+
+    # 某些环境下 python 缺少 pip，先尝试 ensurepip 修复后重试
+    if "no module named pip" in merged_output:
+        console.print("  [yellow]检测到当前 Python 缺少 pip，尝试自动修复...[/yellow]")
+        _run(
+            [runtime_python, "-m", "ensurepip", "--upgrade"],
+            timeout=300,
+            show_last_lines=3,
+        )
+        r_retry = _run(
+            [runtime_python, "-m", "pip", "install", *install_args],
+            timeout=timeout,
+        )
+        if r_retry.returncode == 0:
+            return True
+        merged_output = f"{r_retry.stdout or ''}\n{r_retry.stderr or ''}".lower()
+
     need_break_flag = (
         platform.system() == "Linux"
         and (
@@ -767,12 +785,9 @@ def install_python_deps() -> bool:
         except Exception:
             console.print("  [yellow]Poetry 执行异常，尝试 pip 方案...[/yellow]")
 
-    # pip 回退：优先使用现有 .venv；若不存在则直接使用当前 Python 环境
+    # pip 回退：始终使用当前 Python 环境
     runtime_python = _runtime_python()
-    if runtime_python == sys.executable:
-        console.print(f"  使用当前 Python 环境: [dim]{runtime_python}[/dim]")
-    else:
-        console.print(f"  使用项目虚拟环境: [dim]{runtime_python}[/dim]")
+    console.print(f"  使用当前 Python 环境: [dim]{runtime_python}[/dim]")
 
     console.print("  升级 pip 基础工具...")
     _pip_install_with_fallback(
@@ -784,22 +799,14 @@ def install_python_deps() -> bool:
     # 仅按 pyproject 安装，确保依赖定义单一来源
     console.print("  使用 pip 按 pyproject.toml 安装项目依赖...")
     if _pip_install_with_fallback(runtime_python, ["."], timeout=900):
-        if runtime_python == sys.executable:
-            console.print("  [green]✓[/green] Python 依赖安装成功 (pip + 当前环境)")
-        else:
-            console.print("  [green]✓[/green] Python 依赖安装成功 (pip + .venv)")
+        console.print("  [green]✓[/green] Python 依赖安装成功 (pip + 当前环境)")
         return True
 
     console.print("  [yellow]常规安装失败，尝试关闭 build isolation 重试...[/yellow]")
     if _pip_install_with_fallback(runtime_python, ["--no-build-isolation", "."], timeout=900):
-        if runtime_python == sys.executable:
-            console.print(
-                "  [green]✓[/green] Python 依赖安装成功 (pip + 当前环境 + no-build-isolation)"
-            )
-        else:
-            console.print(
-                "  [green]✓[/green] Python 依赖安装成功 (pip + .venv + no-build-isolation)"
-            )
+        console.print(
+            "  [green]✓[/green] Python 依赖安装成功 (pip + 当前环境 + no-build-isolation)"
+        )
         return True
 
     console.print("  [red]✗[/red] pip 安装失败")
