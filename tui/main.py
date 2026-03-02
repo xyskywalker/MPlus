@@ -30,35 +30,31 @@ try:
     from rich.text import Text
 except ImportError:
     print("正在安装运行依赖（来自 pyproject.toml）...")
-    bootstrap_root = Path(__file__).parent.parent.resolve()
-    bootstrap_venv = bootstrap_root / ".venv"
-    if platform.system() == "Windows":
-        bootstrap_python = bootstrap_venv / "Scripts" / "python.exe"
-    else:
-        bootstrap_python = bootstrap_venv / "bin" / "python"
+    install_cmd = [sys.executable, "-m", "pip", "install", "."]
+    result = subprocess.run(install_cmd, capture_output=True, text=True)
+    if result.returncode != 0 and platform.system() == "Linux":
+        merged_output = f"{result.stdout}\n{result.stderr}".lower()
+        if (
+            "break-system-packages" in merged_output
+            or "externally-managed-environment" in merged_output
+            or "pep 668" in merged_output
+        ):
+            retry_cmd = [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--break-system-packages",
+                ".",
+            ]
+            result = subprocess.run(retry_cmd, capture_output=True, text=True)
 
-    # Linux 发行版常启用 PEP 668（系统 Python 禁止直接 pip 安装），
-    # 因此优先创建项目 .venv 并在 .venv 中按 pyproject 安装依赖。
-    if sys.prefix == sys.base_prefix:
-        if not bootstrap_python.exists():
-            subprocess.check_call(
-                [sys.executable, "-m", "venv", str(bootstrap_venv)],
-                stdout=subprocess.DEVNULL,
-            )
-        subprocess.check_call(
-            [str(bootstrap_python), "-m", "pip", "install", "--upgrade", "pip"],
-            stdout=subprocess.DEVNULL,
-        )
-        subprocess.check_call(
-            [str(bootstrap_python), "-m", "pip", "install", "."],
-            stdout=subprocess.DEVNULL,
-        )
-        os.execv(str(bootstrap_python), [str(bootstrap_python), *sys.argv])
-    else:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "."],
-            stdout=subprocess.DEVNULL,
-        )
+    if result.returncode != 0:
+        output = (result.stderr or result.stdout or "").strip()
+        for line in output.splitlines()[-8:]:
+            print(line)
+        raise SystemExit("安装运行依赖失败，请检查 pip/网络后重试。")
+
     from rich import box  # noqa: E402
     from rich.console import Console  # noqa: E402
     from rich.panel import Panel  # noqa: E402
@@ -114,29 +110,6 @@ def _runtime_python() -> str:
     """返回当前应使用的 Python 解释器（优先 .venv）"""
     venv_python = _venv_python_path()
     return str(venv_python) if venv_python.exists() else sys.executable
-
-
-def _ensure_project_venv() -> bool:
-    """确保项目 .venv 存在"""
-    venv_python = _venv_python_path()
-    if venv_python.exists():
-        return True
-
-    console.print("  正在创建项目虚拟环境 .venv ...")
-    try:
-        r = _run([sys.executable, "-m", "venv", str(VENV_DIR)], timeout=180)
-        if r.returncode != 0:
-            console.print("  [red]✗[/red] 创建 .venv 失败")
-            if platform.system() == "Linux":
-                console.print(
-                    "  [dim]提示: 若报 No module named venv，请先安装 python3-venv 包。[/dim]"
-                )
-            return False
-    except Exception as e:
-        console.print(f"  [red]✗[/red] 创建 .venv 失败: {e}")
-        return False
-
-    return venv_python.exists()
 
 
 def _read_pyproject_dependency_names() -> list[str]:
@@ -229,6 +202,41 @@ def _run(cmd, cwd=None, timeout=300, show_last_lines=5) -> subprocess.CompletedP
             for line in lines:
                 console.print(f"    [dim]{line}[/dim]")
     return result
+
+
+def _pip_install_with_fallback(
+    runtime_python: str,
+    install_args: list[str],
+    timeout: int = 900,
+) -> bool:
+    """执行 pip install，Linux PEP 668 场景下自动追加 --break-system-packages 重试"""
+    r = _run(
+        [runtime_python, "-m", "pip", "install", *install_args],
+        timeout=timeout,
+    )
+    if r.returncode == 0:
+        return True
+
+    merged_output = f"{r.stdout or ''}\n{r.stderr or ''}".lower()
+    need_break_flag = (
+        platform.system() == "Linux"
+        and (
+            "break-system-packages" in merged_output
+            or "externally-managed-environment" in merged_output
+            or "pep 668" in merged_output
+        )
+    )
+    if not need_break_flag:
+        return False
+
+    console.print(
+        "  [yellow]检测到系统 Python 受限（PEP 668），自动追加 --break-system-packages 重试...[/yellow]"
+    )
+    r2 = _run(
+        [runtime_python, "-m", "pip", "install", "--break-system-packages", *install_args],
+        timeout=timeout,
+    )
+    return r2.returncode == 0
 
 
 def open_browser(url: str):
@@ -759,62 +767,43 @@ def install_python_deps() -> bool:
         except Exception:
             console.print("  [yellow]Poetry 执行异常，尝试 pip 方案...[/yellow]")
 
-    # pip 回退：统一安装到项目 .venv，规避系统 Python 的 PEP 668 限制
-    if not _ensure_project_venv():
-        return False
+    # pip 回退：优先使用现有 .venv；若不存在则直接使用当前 Python 环境
     runtime_python = _runtime_python()
-    console.print(f"  使用项目虚拟环境: [dim]{runtime_python}[/dim]")
+    if runtime_python == sys.executable:
+        console.print(f"  使用当前 Python 环境: [dim]{runtime_python}[/dim]")
+    else:
+        console.print(f"  使用项目虚拟环境: [dim]{runtime_python}[/dim]")
 
     console.print("  升级 pip 基础工具...")
-    _run(
-        [
-            runtime_python,
-            "-m",
-            "pip",
-            "install",
-            "--upgrade",
-            "pip",
-            "setuptools",
-            "wheel",
-        ],
+    _pip_install_with_fallback(
+        runtime_python,
+        ["--upgrade", "pip", "setuptools", "wheel"],
         timeout=300,
-        show_last_lines=3,
     )
 
     # 仅按 pyproject 安装，确保依赖定义单一来源
     console.print("  使用 pip 按 pyproject.toml 安装项目依赖...")
-    try:
-        r = _run(
-            [runtime_python, "-m", "pip", "install", "."],
-            timeout=900,
-        )
-        if r.returncode == 0:
+    if _pip_install_with_fallback(runtime_python, ["."], timeout=900):
+        if runtime_python == sys.executable:
+            console.print("  [green]✓[/green] Python 依赖安装成功 (pip + 当前环境)")
+        else:
             console.print("  [green]✓[/green] Python 依赖安装成功 (pip + .venv)")
-            return True
-        console.print("  [yellow]常规安装失败，尝试关闭 build isolation 重试...[/yellow]")
-    except subprocess.TimeoutExpired:
-        console.print("  [yellow]常规安装超时，尝试关闭 build isolation 重试...[/yellow]")
-    except Exception:
-        console.print("  [yellow]常规安装异常，尝试关闭 build isolation 重试...[/yellow]")
+        return True
 
-    try:
-        r = _run(
-            [runtime_python, "-m", "pip", "install", "--no-build-isolation", "."],
-            timeout=900,
-        )
-        if r.returncode == 0:
+    console.print("  [yellow]常规安装失败，尝试关闭 build isolation 重试...[/yellow]")
+    if _pip_install_with_fallback(runtime_python, ["--no-build-isolation", "."], timeout=900):
+        if runtime_python == sys.executable:
+            console.print(
+                "  [green]✓[/green] Python 依赖安装成功 (pip + 当前环境 + no-build-isolation)"
+            )
+        else:
             console.print(
                 "  [green]✓[/green] Python 依赖安装成功 (pip + .venv + no-build-isolation)"
             )
-            return True
-        console.print("  [red]✗[/red] pip 安装失败")
-        return False
-    except subprocess.TimeoutExpired:
-        console.print("  [red]✗[/red] pip 安装超时（900 秒）")
-        return False
-    except Exception as e:
-        console.print(f"  [red]✗[/red] pip 安装失败: {e}")
-        return False
+        return True
+
+    console.print("  [red]✗[/red] pip 安装失败")
+    return False
 
 
 def install_frontend_deps() -> bool:
