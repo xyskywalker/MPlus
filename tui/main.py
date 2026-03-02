@@ -45,6 +45,8 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 DATA_DIR = PROJECT_ROOT / "data"
 TUI_STATE_DIR = DATA_DIR / "tui"
 SERVER_LOG_FILE = TUI_STATE_DIR / "server.log"
+RIPPLE_GIT_URL = "https://github.com/xyskywalker/Ripple.git"
+RIPPLE_GIT_TAG = "v0.2.0"
 
 # 控制台实例
 console = Console()
@@ -433,7 +435,7 @@ def check_frontend_deps() -> bool:
 
 def check_python_deps() -> bool:
     """检查关键 Python 依赖是否可导入"""
-    for mod in ("fastapi", "uvicorn", "sqlalchemy", "aiosqlite", "pydantic"):
+    for mod in ("fastapi", "uvicorn", "sqlalchemy", "aiosqlite", "pydantic", "ripple"):
         try:
             __import__(mod)
         except ImportError:
@@ -575,6 +577,7 @@ def ensure_env_file() -> bool:
         env_path.write_text(
             "HOST=0.0.0.0\nPORT=8000\nDEBUG=true\n"
             "DATABASE_URL=sqlite:///./data/mplus.db\n"
+            "AUTH_USERNAME=\nAUTH_PASSWORD=\n"
             "SIMULATION_ENGINE=mock\n",
             encoding="utf-8",
         )
@@ -615,12 +618,29 @@ def install_python_deps() -> bool:
         except Exception:
             console.print("  [yellow]Poetry 执行异常，尝试 pip 方案...[/yellow]")
 
-    # pip 回退
-    console.print("  使用 pip 安装核心依赖...")
+    # pip 回退（优先按 pyproject 安装，确保与 Poetry 依赖一致）
+    console.print("  使用 pip 按 pyproject.toml 安装项目依赖...")
+    try:
+        r = _run(
+            [sys.executable, "-m", "pip", "install", "."],
+            timeout=900,
+        )
+        if r.returncode == 0:
+            console.print("  [green]✓[/green] Python 依赖安装成功 (pip + pyproject)")
+            return True
+        console.print("  [yellow]pip 按 pyproject 安装失败，尝试手动依赖兜底...[/yellow]")
+    except subprocess.TimeoutExpired:
+        console.print("  [yellow]pip 按 pyproject 安装超时，尝试手动依赖兜底...[/yellow]")
+    except Exception:
+        console.print("  [yellow]pip 按 pyproject 安装异常，尝试手动依赖兜底...[/yellow]")
+
+    # pip 兜底：手工安装核心依赖 + Ripple（git）
+    console.print("  使用 pip 安装核心依赖（含 Ripple git 依赖）...")
     core_deps = [
         "fastapi>=0.109.0",
         "uvicorn[standard]>=0.27.0",
         "websockets>=12.0",
+        "camel-ai>=0.2.0",
         "sqlalchemy>=2.0.0",
         "aiosqlite>=0.19.0",
         "httpx>=0.27.0",
@@ -630,6 +650,7 @@ def install_python_deps() -> bool:
         "rich>=13.0.0",
         "pyyaml>=6.0",
         "cachetools>=5.3.0",
+        f"ripple @ git+{RIPPLE_GIT_URL}@{RIPPLE_GIT_TAG}",
     ]
     try:
         r = _run(
@@ -885,6 +906,8 @@ def auto_initialize():
         f"[bold green]初始化完成！[/bold green]\n\n"
         f"  访问地址: [link]http://localhost:{port}[/link]\n"
         f"  API 文档: [link]http://localhost:{port}/docs[/link]\n\n"
+        f"  登录配置位置: [dim]{PROJECT_ROOT / '.env'}[/dim]\n"
+        f"  登录配置项: [bold]AUTH_USERNAME[/bold] / [bold]AUTH_PASSWORD[/bold]\n\n"
         f"  [dim]首次使用请到「设置 → 模型配置」中添加 AI 模型的 API Key[/dim]",
         title="完成",
         border_style="green",
@@ -1232,6 +1255,8 @@ def config_management():
     table.add_row("服务端口 (PORT)", env_vars.get("PORT", "8000"))
     table.add_row("调试模式 (DEBUG)", env_vars.get("DEBUG", "false"))
     table.add_row("数据库路径", env_vars.get("DATABASE_URL", "sqlite:///./data/mplus.db"))
+    table.add_row("登录用户名", env_vars.get("AUTH_USERNAME", "(未配置)"))
+    table.add_row("登录密码", "******（请在 .env 中修改 AUTH_PASSWORD）")
     table.add_row("模拟引擎", env_vars.get("SIMULATION_ENGINE", "ripple"))
 
     console.print(table)

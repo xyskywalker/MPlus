@@ -26,6 +26,16 @@ class Settings(BaseSettings):
         description="数据库连接URL"
     )
 
+    # 简单登录配置（单用户，明文保存在 .env）
+    auth_username: str = Field(
+        ...,
+        description="系统登录用户名（单用户）",
+    )
+    auth_password: str = Field(
+        ...,
+        description="系统登录密码（单用户）",
+    )
+
     # ===== Ripple 模拟引擎配置 =====
     simulation_engine: str = Field(
         default="ripple",

@@ -34,6 +34,12 @@ const setupInterceptors = (instance: typeof api) => {
       return Promise.reject(new Error(data.message || '请求失败'))
     },
     (error) => {
+      const status = error?.response?.status
+      const requestUrl = String(error?.config?.url || '')
+      const isAuthApi = requestUrl.includes('/auth/login') || requestUrl.includes('/auth/status')
+      if (status === 401 && !isAuthApi && window.location.pathname !== '/login') {
+        window.location.href = '/login'
+      }
       console.error('API Error:', error)
       return Promise.reject(error)
     }
@@ -88,6 +94,25 @@ export interface SystemStatus {
 
 export const getSystemStatus = (): Promise<SystemStatus> => {
   return api.get('/settings/status')
+}
+
+// ==================== 登录认证 ====================
+
+export interface AuthStatus {
+  logged_in: boolean
+  username: string | null
+}
+
+export const login = (username: string, password: string): Promise<{ username: string }> => {
+  return api.post('/auth/login', { username, password })
+}
+
+export const logout = (): Promise<void> => {
+  return api.post('/auth/logout')
+}
+
+export const getAuthStatus = (): Promise<AuthStatus> => {
+  return api.get('/auth/status')
 }
 
 // ==================== 模型配置 ====================

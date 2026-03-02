@@ -4,10 +4,11 @@
  * 负责加载全局配置（应用选项）
  */
 
-import { Outlet, NavLink } from 'react-router-dom'
+import { Outlet, NavLink, useNavigate } from 'react-router-dom'
 import { useState, useEffect } from 'react'
-import { getAppOptions } from '../services/api'
+import { getAppOptions, logout } from '../services/api'
 import { useAppStore } from '../stores/appStore'
+import { useAuthStore } from '../stores/authStore'
 import { APP_VERSION, APP_NAME, APP_TAGLINE, GITHUB_URL, LICENSE_URL, LICENSE_NAME, RIPPLE_URL } from '../config'
 
 // 读取 cookie 中保存的主题偏好
@@ -24,6 +25,7 @@ function setThemeCookie(isDark: boolean) {
 }
 
 export default function Layout() {
+  const navigate = useNavigate()
   const [isDark, setIsDark] = useState(() => {
     // 初始化时从 cookie 读取主题偏好
     const saved = getThemeFromCookie()
@@ -33,7 +35,8 @@ export default function Layout() {
     }
     return saved
   })
-  const { setAppOptions, appOptionsLoaded } = useAppStore()
+  const { setAppOptions, appOptionsLoaded, showToast } = useAppStore()
+  const { username, clearAuthState } = useAuthStore()
 
   // 加载应用选项配置
   useEffect(() => {
@@ -62,6 +65,18 @@ export default function Layout() {
         ? 'text-primary-600 dark:text-primary-400 bg-primary-50 dark:bg-primary-900/20'
         : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-dark-800'
     }`
+
+  const handleLogout = async () => {
+    try {
+      await logout()
+    } catch (err) {
+      console.error('注销失败:', err)
+    } finally {
+      clearAuthState()
+      showToast('info', '已注销')
+      navigate('/login', { replace: true })
+    }
+  }
 
   return (
     <div className="h-screen flex flex-col bg-gray-50 dark:bg-dark-900 overflow-hidden">
@@ -101,6 +116,16 @@ export default function Layout() {
 
             {/* 右侧工具栏 */}
             <div className="flex items-center space-x-1">
+              <span className="hidden lg:inline text-sm text-gray-500 dark:text-gray-400 mr-1">
+                {username || ''}
+              </span>
+              <button
+                onClick={handleLogout}
+                className="px-3 py-1.5 text-sm rounded-lg text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-dark-800 transition-colors"
+                title="注销登录"
+              >
+                注销
+              </button>
               {/* Ripple 模拟引擎链接 */}
               <a
                 href={RIPPLE_URL}

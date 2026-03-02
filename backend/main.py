@@ -4,7 +4,7 @@ MPlus FastAPI 应用入口
 """
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, WebSocket, Query, status
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,6 +13,8 @@ from typing import Optional, List, Dict, Any
 import logging
 from pathlib import Path
 import uuid
+import secrets
+import time
 
 from .config import settings
 from .exceptions import MplusException
@@ -24,6 +26,51 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# 简单登录会话（内存态，单机单进程）
+AUTH_COOKIE_NAME = "mplus_auth_token"
+AUTH_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
+auth_sessions: dict[str, float] = {}
+
+
+def _cleanup_expired_auth_sessions():
+    now = time.time()
+    expired_tokens = [
+        token for token, expires_at in auth_sessions.items()
+        if expires_at <= now
+    ]
+    for token in expired_tokens:
+        auth_sessions.pop(token, None)
+
+
+def _create_auth_session() -> str:
+    _cleanup_expired_auth_sessions()
+    token = secrets.token_urlsafe(32)
+    auth_sessions[token] = time.time() + AUTH_SESSION_TTL_SECONDS
+    return token
+
+
+def _is_authenticated_token(token: Optional[str]) -> bool:
+    if not token:
+        return False
+    _cleanup_expired_auth_sessions()
+    expires_at = auth_sessions.get(token)
+    if not expires_at:
+        return False
+    if expires_at <= time.time():
+        auth_sessions.pop(token, None)
+        return False
+    return True
+
+
+def _remove_auth_session(token: Optional[str]):
+    if token:
+        auth_sessions.pop(token, None)
+
+
+def _normalize_api_path(path: str) -> str:
+    normalized = path.rstrip("/")
+    return normalized if normalized else "/"
 
 
 @asynccontextmanager
@@ -63,6 +110,41 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """API 鉴权中间件（单用户登录）"""
+    path = _normalize_api_path(request.url.path)
+
+    if not path.startswith("/api"):
+        return await call_next(request)
+
+    # CORS 预检请求放行
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    public_paths = {
+        "/api/health",
+        "/api/auth/login",
+        "/api/auth/logout",
+        "/api/auth/status",
+    }
+    if path in public_paths:
+        return await call_next(request)
+
+    token = request.cookies.get(AUTH_COOKIE_NAME)
+    if not _is_authenticated_token(token):
+        return JSONResponse(
+            status_code=401,
+            content={
+                "code": 401,
+                "data": None,
+                "message": "未登录或登录已失效",
+            },
+        )
+
+    return await call_next(request)
 
 
 # 全局异常处理
@@ -105,6 +187,65 @@ async def health_check():
             "version": "1.0.0"
         },
         "message": "success"
+    }
+
+
+# ==================== 登录认证 ====================
+
+class LoginRequest(BaseModel):
+    """登录请求"""
+    username: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=1)
+
+
+@app.post("/api/auth/login")
+async def login(data: LoginRequest):
+    """账号登录（单用户）"""
+    if (
+        data.username != settings.auth_username
+        or data.password != settings.auth_password
+    ):
+        raise HTTPException(status_code=401, detail="登录失败")
+
+    token = _create_auth_session()
+    response = JSONResponse({
+        "code": 0,
+        "data": {"username": settings.auth_username},
+        "message": "success",
+    })
+    response.set_cookie(
+        key=AUTH_COOKIE_NAME,
+        value=token,
+        max_age=AUTH_SESSION_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/auth/logout")
+async def logout(request: Request):
+    """注销登录"""
+    token = request.cookies.get(AUTH_COOKIE_NAME)
+    _remove_auth_session(token)
+    response = JSONResponse({"code": 0, "data": None, "message": "success"})
+    response.delete_cookie(AUTH_COOKIE_NAME, path="/")
+    return response
+
+
+@app.get("/api/auth/status")
+async def auth_status(request: Request):
+    """登录状态检查"""
+    token = request.cookies.get(AUTH_COOKIE_NAME)
+    logged_in = _is_authenticated_token(token)
+    return {
+        "code": 0,
+        "data": {
+            "logged_in": logged_in,
+            "username": settings.auth_username if logged_in else None,
+        },
+        "message": "success",
     }
 
 
@@ -500,7 +641,21 @@ app.include_router(accounts.router, prefix="/api", tags=["账号"])
 app.include_router(chat.router, prefix="/api", tags=["对话"])
 
 # 注册 WebSocket 路由（在 /ws 路径下，与 Vite 代理配置匹配）
-app.websocket("/ws/chat/{session_id}")(websocket_chat)
+@app.websocket("/ws/chat/{session_id}")
+async def websocket_chat_guard(
+    websocket: WebSocket,
+    session_id: str,
+    platform: Optional[str] = Query(None),
+):
+    token = websocket.cookies.get(AUTH_COOKIE_NAME)
+    if not _is_authenticated_token(token):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    await websocket_chat(
+        websocket=websocket,
+        session_id=session_id,
+        platform=platform,
+    )
 
 
 # ==================== 静态文件服务 ====================
