@@ -30,7 +30,7 @@ try:
     from rich.text import Text
 except ImportError:
     print("正在安装运行依赖（来自 pyproject.toml）...")
-    install_cmd = [sys.executable, "-m", "pip", "install", "."]
+    install_cmd = [sys.executable, "-m", "pip", "install", "-e", "."]
     result = subprocess.run(install_cmd, capture_output=True, text=True)
     if result.returncode != 0:
         merged_output = f"{result.stdout}\n{result.stderr}".lower()
@@ -55,6 +55,7 @@ except ImportError:
                 "pip",
                 "install",
                 "--break-system-packages",
+                "-e",
                 ".",
             ]
             result = subprocess.run(retry_cmd, capture_output=True, text=True)
@@ -185,6 +186,23 @@ def _missing_python_deps(runtime_python: str) -> list[str]:
     except Exception:
         pass
     return dep_names
+
+
+def _pip_check_status(runtime_python: str) -> tuple[bool, str]:
+    """执行 pip check，返回(是否通过, 摘要信息)"""
+    r = _run(
+        [runtime_python, "-m", "pip", "check"],
+        timeout=120,
+        show_last_lines=0,
+    )
+    if r.returncode == 0:
+        return True, "依赖关系正常"
+
+    output = (r.stdout or r.stderr or "").strip()
+    if not output:
+        return False, "pip check 未通过"
+    first_line = output.splitlines()[0].strip()
+    return False, first_line
 
 
 def _run(cmd, cwd=None, timeout=300, show_last_lines=5) -> subprocess.CompletedProcess:
@@ -599,7 +617,10 @@ def check_python_deps() -> bool:
     """检查关键 Python 依赖是否可导入"""
     runtime_python = _runtime_python()
     missing = _missing_python_deps(runtime_python)
-    return len(missing) == 0
+    if missing:
+        return False
+    pip_ok, _ = _pip_check_status(runtime_python)
+    return pip_ok
 
 
 def run_environment_check() -> Dict[str, dict]:
@@ -648,9 +669,13 @@ def run_environment_check() -> Dict[str, dict]:
     # Python 依赖
     runtime_python = _runtime_python()
     missing_py = _missing_python_deps(runtime_python)
+    pip_ok, pip_msg = _pip_check_status(runtime_python)
     has_py = len(missing_py) == 0
-    if has_py:
+    if has_py and pip_ok:
         py_detail = "pyproject 依赖就绪"
+    elif has_py and not pip_ok:
+        py_detail = f"依赖关系异常: {pip_msg}"
+        has_py = False
     else:
         preview = ", ".join(missing_py[:4])
         suffix = " ..." if len(missing_py) > 4 else ""
@@ -798,12 +823,24 @@ def install_python_deps() -> bool:
 
     # 仅按 pyproject 安装，确保依赖定义单一来源
     console.print("  使用 pip 按 pyproject.toml 安装项目依赖...")
-    if _pip_install_with_fallback(runtime_python, ["."], timeout=900):
+    if _pip_install_with_fallback(runtime_python, ["-e", "."], timeout=900):
+        pip_ok, pip_msg = _pip_check_status(runtime_python)
+        if not pip_ok:
+            console.print(f"  [red]✗[/red] 依赖关系校验失败: {pip_msg}")
+            return False
         console.print("  [green]✓[/green] Python 依赖安装成功 (pip + 当前环境)")
         return True
 
     console.print("  [yellow]常规安装失败，尝试关闭 build isolation 重试...[/yellow]")
-    if _pip_install_with_fallback(runtime_python, ["--no-build-isolation", "."], timeout=900):
+    if _pip_install_with_fallback(
+        runtime_python,
+        ["--no-build-isolation", "-e", "."],
+        timeout=900,
+    ):
+        pip_ok, pip_msg = _pip_check_status(runtime_python)
+        if not pip_ok:
+            console.print(f"  [red]✗[/red] 依赖关系校验失败: {pip_msg}")
+            return False
         console.print(
             "  [green]✓[/green] Python 依赖安装成功 (pip + 当前环境 + no-build-isolation)"
         )
@@ -1032,16 +1069,31 @@ def auto_initialize():
     if check_database():
         console.print("  [green]✓[/green] 数据库已存在")
     else:
-        init_database()
+        if not init_database():
+            console.print("[red]数据库初始化失败，无法继续[/red]")
+            return
 
     # ---- 步骤 6 ----
     _step_header(6, total, "启动服务")
     status = get_server_status()
+    startup_ok = False
     if status["running"]:
         console.print(f"  [green]✓[/green] 服务已在运行 (PID: {status['pid']})")
         open_browser(status["url"])
+        startup_ok = True
     else:
-        start_server(auto_open_browser=True)
+        startup_ok = start_server(auto_open_browser=True)
+
+    if not startup_ok:
+        console.print(Panel(
+            "[bold red]初始化未完成[/bold red]\n\n"
+            "  服务启动失败，请使用「8. 查看日志」排查后重试。\n"
+            "  可先执行「5. 安装依赖」确保依赖完整。",
+            title="失败",
+            border_style="red",
+            box=box.HEAVY,
+        ))
+        return
 
     # ---- 完成 ----
     console.print()
@@ -1137,7 +1189,7 @@ def _wait_for_server(port: str, pid: Optional[int], max_wait: int = 15) -> str:
     return "failed"
 
 
-def start_server(auto_open_browser: bool = False):
+def start_server(auto_open_browser: bool = False) -> bool:
     """启动 Web 服务"""
     global server_process
 
@@ -1146,12 +1198,12 @@ def start_server(auto_open_browser: bool = False):
         console.print(f"[yellow]服务已在运行中 (PID: {status['pid']})[/yellow]")
         if auto_open_browser:
             open_browser(status["url"])
-        return
+        return True
 
     # 前置检查
     if not check_python_deps():
         console.print("[red]Python 依赖缺失，请先执行「5. 安装依赖」[/red]")
-        return
+        return False
     if not check_frontend_built():
         console.print(
             "[yellow]前端未构建，Web 界面将不可用"
@@ -1172,7 +1224,7 @@ def start_server(auto_open_browser: bool = False):
         console.print(f"  访问地址: [link]{url}[/link]")
         if auto_open_browser:
             open_browser(url)
-        return
+        return True
     if scan["others"]:
         pid = scan["others"][0][0]
         console.print(
@@ -1181,7 +1233,7 @@ def start_server(auto_open_browser: bool = False):
         console.print(
             "  [dim]请先释放该端口，或在 .env 中修改 PORT 后重试。[/dim]"
         )
-        return
+        return False
     if _is_tcp_port_open(port):
         console.print(
             f"[red]端口 {port} 已可连通，但无法精确识别进程 PID，为避免误判不会启动新服务[/red]"
@@ -1189,7 +1241,7 @@ def start_server(auto_open_browser: bool = False):
         console.print(
             "  [dim]请安装 lsof/ss（或在 Windows 保证 netstat+wmic 可用）后重试。[/dim]"
         )
-        return
+        return False
 
     _ensure_runtime_dir()
     startup_marker = (
@@ -1240,20 +1292,24 @@ def start_server(auto_open_browser: bool = False):
             )
             if should_open:
                 open_browser(url)
+            return True
         elif wait_result == "alive_timeout":
             console.print(
                 "[yellow]服务仍在后台启动中，请稍后用「3. 系统状态」确认是否就绪[/yellow]"
             )
             console.print(f"  日志文件: [dim]{SERVER_LOG_FILE}[/dim]")
+            return True
         else:
             for line in _tail_log_lines(max_lines=8):
                 console.print(f"  [dim]{line}[/dim]")
             server_process = None
             console.print("[red]服务启动失败[/red]")
+            return False
 
     except Exception as e:
         console.print(f"[red]启动失败: {e}[/red]")
         server_process = None
+        return False
 
 
 def stop_server():
