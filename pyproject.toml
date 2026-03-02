@@ -28,7 +28,9 @@ camel-ai = "^0.2.0"
 # 模拟引擎 — Ripple CAS 社会行为预测引擎
 # 开发阶段使用本地路径，Clone Ripple仓库(https://github.com/xyskywalker/Ripple)后调整对应目录位置即可。
 # 生产部署可切换为 git 依赖：
-ripple = {git = "https://github.com/xyskywalker/Ripple.git", tag = "v0.2.0"}
+# ripple = {git = "https://github.com/xyskywalker/Ripple.git", tag = "v0.2.0"}
+# 加速方式，方便国内下载（注意：git 字段填写仓库 URL，不是 git clone 命令）
+ripple = {git = "https://gh-proxy.org/github.com/xyskywalker/Ripple.git", tag = "v0.2.0"}
 # ripple = {path = "../Ripple", develop = true}
 
 # 数据库

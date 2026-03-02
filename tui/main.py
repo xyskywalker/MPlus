@@ -14,6 +14,8 @@ import sys
 import time
 import webbrowser
 import os
+import json
+import tomllib
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -27,11 +29,36 @@ try:
     from rich.table import Table
     from rich.text import Text
 except ImportError:
-    print("正在安装界面组件 (rich)...")
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "rich"],
-        stdout=subprocess.DEVNULL,
-    )
+    print("正在安装运行依赖（来自 pyproject.toml）...")
+    bootstrap_root = Path(__file__).parent.parent.resolve()
+    bootstrap_venv = bootstrap_root / ".venv"
+    if platform.system() == "Windows":
+        bootstrap_python = bootstrap_venv / "Scripts" / "python.exe"
+    else:
+        bootstrap_python = bootstrap_venv / "bin" / "python"
+
+    # Linux 发行版常启用 PEP 668（系统 Python 禁止直接 pip 安装），
+    # 因此优先创建项目 .venv 并在 .venv 中按 pyproject 安装依赖。
+    if sys.prefix == sys.base_prefix:
+        if not bootstrap_python.exists():
+            subprocess.check_call(
+                [sys.executable, "-m", "venv", str(bootstrap_venv)],
+                stdout=subprocess.DEVNULL,
+            )
+        subprocess.check_call(
+            [str(bootstrap_python), "-m", "pip", "install", "--upgrade", "pip"],
+            stdout=subprocess.DEVNULL,
+        )
+        subprocess.check_call(
+            [str(bootstrap_python), "-m", "pip", "install", "."],
+            stdout=subprocess.DEVNULL,
+        )
+        os.execv(str(bootstrap_python), [str(bootstrap_python), *sys.argv])
+    else:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "."],
+            stdout=subprocess.DEVNULL,
+        )
     from rich import box  # noqa: E402
     from rich.console import Console  # noqa: E402
     from rich.panel import Panel  # noqa: E402
@@ -45,8 +72,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 DATA_DIR = PROJECT_ROOT / "data"
 TUI_STATE_DIR = DATA_DIR / "tui"
 SERVER_LOG_FILE = TUI_STATE_DIR / "server.log"
-RIPPLE_GIT_URL = "https://github.com/xyskywalker/Ripple.git"
-RIPPLE_GIT_TAG = "v0.2.0"
+VENV_DIR = PROJECT_ROOT / ".venv"
 
 # 控制台实例
 console = Console()
@@ -75,6 +101,116 @@ def get_version() -> str:
 def _npm_cmd() -> str:
     """返回当前平台的 npm 可执行命令名"""
     return "npm.cmd" if platform.system() == "Windows" else "npm"
+
+
+def _venv_python_path() -> Path:
+    """返回项目 .venv 内 Python 可执行文件路径"""
+    if platform.system() == "Windows":
+        return VENV_DIR / "Scripts" / "python.exe"
+    return VENV_DIR / "bin" / "python"
+
+
+def _runtime_python() -> str:
+    """返回当前应使用的 Python 解释器（优先 .venv）"""
+    venv_python = _venv_python_path()
+    return str(venv_python) if venv_python.exists() else sys.executable
+
+
+def _ensure_project_venv() -> bool:
+    """确保项目 .venv 存在"""
+    venv_python = _venv_python_path()
+    if venv_python.exists():
+        return True
+
+    console.print("  正在创建项目虚拟环境 .venv ...")
+    try:
+        r = _run([sys.executable, "-m", "venv", str(VENV_DIR)], timeout=180)
+        if r.returncode != 0:
+            console.print("  [red]✗[/red] 创建 .venv 失败")
+            if platform.system() == "Linux":
+                console.print(
+                    "  [dim]提示: 若报 No module named venv，请先安装 python3-venv 包。[/dim]"
+                )
+            return False
+    except Exception as e:
+        console.print(f"  [red]✗[/red] 创建 .venv 失败: {e}")
+        return False
+
+    return venv_python.exists()
+
+
+def _read_pyproject_dependency_names() -> list[str]:
+    """从 pyproject.toml 读取主依赖包名列表（不含 python）"""
+    pyproject_path = PROJECT_ROOT / "pyproject.toml"
+    if not pyproject_path.exists():
+        return []
+
+    try:
+        data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    dep_names: set[str] = set()
+
+    # Poetry 格式: [tool.poetry.dependencies]
+    poetry_deps = (
+        data.get("tool", {})
+        .get("poetry", {})
+        .get("dependencies", {})
+    )
+    if isinstance(poetry_deps, dict):
+        for name in poetry_deps.keys():
+            if str(name).lower() == "python":
+                continue
+            dep_names.add(str(name))
+
+    # PEP 621 格式: [project.dependencies]（兼容未来迁移）
+    project_deps = data.get("project", {}).get("dependencies", [])
+    if isinstance(project_deps, list):
+        for item in project_deps:
+            if not isinstance(item, str):
+                continue
+            head = item.split(";", 1)[0].strip()
+            m = re.match(r"[A-Za-z0-9_.-]+", head)
+            if m:
+                name = m.group(0)
+                if name.lower() != "python":
+                    dep_names.add(name)
+
+    return sorted(dep_names)
+
+
+def _missing_python_deps(runtime_python: str) -> list[str]:
+    """基于 pyproject 依赖，检查指定解释器中缺失的分发包"""
+    dep_names = _read_pyproject_dependency_names()
+    if not dep_names:
+        return ["(无法从 pyproject.toml 读取依赖)"]
+
+    script = (
+        "import importlib.metadata as md, json, sys\n"
+        "deps=json.loads(sys.argv[1])\n"
+        "missing=[]\n"
+        "for name in deps:\n"
+        "    try:\n"
+        "        md.version(name)\n"
+        "    except Exception:\n"
+        "        missing.append(name)\n"
+        "print(json.dumps(missing, ensure_ascii=False))\n"
+    )
+    r = _run(
+        [runtime_python, "-c", script, json.dumps(dep_names, ensure_ascii=False)],
+        timeout=30,
+        show_last_lines=0,
+    )
+    if r.returncode != 0:
+        return dep_names
+    try:
+        parsed = json.loads((r.stdout or "[]").strip() or "[]")
+        if isinstance(parsed, list):
+            return [str(x) for x in parsed]
+    except Exception:
+        pass
+    return dep_names
 
 
 def _run(cmd, cwd=None, timeout=300, show_last_lines=5) -> subprocess.CompletedProcess:
@@ -435,12 +571,9 @@ def check_frontend_deps() -> bool:
 
 def check_python_deps() -> bool:
     """检查关键 Python 依赖是否可导入"""
-    for mod in ("fastapi", "uvicorn", "sqlalchemy", "aiosqlite", "pydantic", "ripple"):
-        try:
-            __import__(mod)
-        except ImportError:
-            return False
-    return True
+    runtime_python = _runtime_python()
+    missing = _missing_python_deps(runtime_python)
+    return len(missing) == 0
 
 
 def run_environment_check() -> Dict[str, dict]:
@@ -487,11 +620,19 @@ def run_environment_check() -> Dict[str, dict]:
     }
 
     # Python 依赖
-    has_py = check_python_deps()
+    runtime_python = _runtime_python()
+    missing_py = _missing_python_deps(runtime_python)
+    has_py = len(missing_py) == 0
+    if has_py:
+        py_detail = "pyproject 依赖就绪"
+    else:
+        preview = ", ".join(missing_py[:4])
+        suffix = " ..." if len(missing_py) > 4 else ""
+        py_detail = f"缺失或未安装: {preview}{suffix}"
     checks["python_deps"] = {
         "name": "Python 依赖包",
         "ok": has_py,
-        "detail": "核心依赖就绪" if has_py else "缺失或不完整",
+        "detail": py_detail,
     }
 
     # 数据目录
@@ -618,52 +759,58 @@ def install_python_deps() -> bool:
         except Exception:
             console.print("  [yellow]Poetry 执行异常，尝试 pip 方案...[/yellow]")
 
-    # pip 回退（优先按 pyproject 安装，确保与 Poetry 依赖一致）
+    # pip 回退：统一安装到项目 .venv，规避系统 Python 的 PEP 668 限制
+    if not _ensure_project_venv():
+        return False
+    runtime_python = _runtime_python()
+    console.print(f"  使用项目虚拟环境: [dim]{runtime_python}[/dim]")
+
+    console.print("  升级 pip 基础工具...")
+    _run(
+        [
+            runtime_python,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "pip",
+            "setuptools",
+            "wheel",
+        ],
+        timeout=300,
+        show_last_lines=3,
+    )
+
+    # 仅按 pyproject 安装，确保依赖定义单一来源
     console.print("  使用 pip 按 pyproject.toml 安装项目依赖...")
     try:
         r = _run(
-            [sys.executable, "-m", "pip", "install", "."],
+            [runtime_python, "-m", "pip", "install", "."],
             timeout=900,
         )
         if r.returncode == 0:
-            console.print("  [green]✓[/green] Python 依赖安装成功 (pip + pyproject)")
+            console.print("  [green]✓[/green] Python 依赖安装成功 (pip + .venv)")
             return True
-        console.print("  [yellow]pip 按 pyproject 安装失败，尝试手动依赖兜底...[/yellow]")
+        console.print("  [yellow]常规安装失败，尝试关闭 build isolation 重试...[/yellow]")
     except subprocess.TimeoutExpired:
-        console.print("  [yellow]pip 按 pyproject 安装超时，尝试手动依赖兜底...[/yellow]")
+        console.print("  [yellow]常规安装超时，尝试关闭 build isolation 重试...[/yellow]")
     except Exception:
-        console.print("  [yellow]pip 按 pyproject 安装异常，尝试手动依赖兜底...[/yellow]")
+        console.print("  [yellow]常规安装异常，尝试关闭 build isolation 重试...[/yellow]")
 
-    # pip 兜底：手工安装核心依赖 + Ripple（git）
-    console.print("  使用 pip 安装核心依赖（含 Ripple git 依赖）...")
-    core_deps = [
-        "fastapi>=0.109.0",
-        "uvicorn[standard]>=0.27.0",
-        "websockets>=12.0",
-        "camel-ai>=0.2.0",
-        "sqlalchemy>=2.0.0",
-        "aiosqlite>=0.19.0",
-        "httpx>=0.27.0",
-        "pydantic>=2.0.0",
-        "pydantic-settings>=2.0.0",
-        "python-dotenv>=1.0.0",
-        "rich>=13.0.0",
-        "pyyaml>=6.0",
-        "cachetools>=5.3.0",
-        f"ripple @ git+{RIPPLE_GIT_URL}@{RIPPLE_GIT_TAG}",
-    ]
     try:
         r = _run(
-            [sys.executable, "-m", "pip", "install", *core_deps],
-            timeout=600,
+            [runtime_python, "-m", "pip", "install", "--no-build-isolation", "."],
+            timeout=900,
         )
         if r.returncode == 0:
-            console.print("  [green]✓[/green] Python 核心依赖安装成功 (pip)")
+            console.print(
+                "  [green]✓[/green] Python 依赖安装成功 (pip + .venv + no-build-isolation)"
+            )
             return True
         console.print("  [red]✗[/red] pip 安装失败")
         return False
     except subprocess.TimeoutExpired:
-        console.print("  [red]✗[/red] pip 安装超时（600 秒）")
+        console.print("  [red]✗[/red] pip 安装超时（900 秒）")
         return False
     except Exception as e:
         console.print(f"  [red]✗[/red] pip 安装失败: {e}")
@@ -748,8 +895,9 @@ def init_database() -> bool:
     ensure_data_dir()
 
     try:
+        runtime_python = _runtime_python()
         r = _run(
-            [sys.executable, "scripts/init_db.py"],
+            [runtime_python, "scripts/init_db.py"],
             timeout=30,
         )
         if r.returncode == 0:
@@ -1053,6 +1201,7 @@ def start_server(auto_open_browser: bool = False):
     )
 
     try:
+        runtime_python = _runtime_python()
         with SERVER_LOG_FILE.open("ab") as log_file:
             log_file.write(startup_marker.encode("utf-8", errors="replace"))
 
@@ -1074,7 +1223,7 @@ def start_server(auto_open_browser: bool = False):
 
             server_process = subprocess.Popen(
                 [
-                    sys.executable, "-m", "uvicorn",
+                    runtime_python, "-m", "uvicorn",
                     "backend.main:app",
                     "--host", host,
                     "--port", port,
