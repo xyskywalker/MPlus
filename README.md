@@ -1,11 +1,13 @@
 <p align="center">
-  <img src="assets/main_visual.png" alt="MPlus 主视觉" width="600">
+  <a href="https://mplus.anspire.cn/" target="_blank">
+    <img src="static/images/image01.png" alt="MPlus 主视觉" width="600">
+  </a>
 </p>
 
 <h1 align="center">百万加 MPlus</h1>
 
 <p align="center">
-  <strong>AI驱动的自媒体选题和模拟预测智能体</strong>
+  <strong>AI驱动的自媒体选题和模拟预测智能体 助您打造爆款内容</strong>
 </p>
 
 <p align="center">
@@ -16,6 +18,22 @@
   <img src="https://img.shields.io/badge/Ripple-CAS-purple" alt="Ripple">
   <img src="https://img.shields.io/badge/License-AGPL--3.0-blue" alt="License">
 </p>
+
+<div align="center">
+
+### 🚀 在线版现已上线！无需部署，开箱即用
+
+**百万加 MPlus 在线版正式发布** — 免安装、免配置，浏览器直达体验全部功能
+
+🎁 **限时福利：新用户注册即送免费使用额度**
+
+<p align="center">
+  <a href="https://mplus.anspire.cn/" target="_blank">
+    <img src="https://img.shields.io/badge/👉 立即体验在线版-mplus.anspire.cn-2563EB?style=for-the-badge&logoColor=white" alt="立即体验">
+  </a>
+</p>
+
+</div>
 
 ---
 
